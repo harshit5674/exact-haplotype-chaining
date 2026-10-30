@@ -1027,6 +1027,7 @@ def baselevel():
     rows, counters = [], []
     tot = dict(reads=0, anchors=0, states=0)
     loads, guarded, compact = [], [], []
+    spans, best_losses = [], []  # extracted reference spans; per-read losses in the better orientation (2026-10-30)
     for w, region in BASE_WINDOWS:
         d = BASE / 'windows' / w
         ins, prov = load(d / 'inspect.json'), load(d / 'panel/provenance.json')
@@ -1035,6 +1036,7 @@ def baselevel():
         assert ins['walks'] == ins['walks_spanning_window'] == eng['H']
         assert val['status'] == 'passed' and val['states'] == eng['states'] and val['instances'] == eng['instances']
         assert prov['conversion']['anchors'] == eng['anchors'] and prov['conversion']['exact_sequence_checks'] == eng['anchors']
+        spans.append(ins['reference_bases'])
         k, src = f'base.{w[:7]}', f'baselevel_feasibility windows/{w}'
         put(f'{k}.start', f'{ins["start"] / 1e6:.3f}', src + '/inspect.json start (Mb)')
         put(f'{k}.end', f'{ins["end"] / 1e6:.3f}', src + '/inspect.json end (Mb)')
@@ -1098,6 +1100,39 @@ def baselevel():
                 below_reads |= {x['read'] for x in either}
             assert len(seen) == prov['reads'], (w, len(seen))
             put(f'{k}.giraffe.below.rho2.reads', str(len(below_reads)), f'baselevel exactness {w} rho 2: distinct reads with an instance below exact (either bonus), from the per-instance rows')
+            # Each read's better orientation (2026-10-30). A read's two orientations are separate instances; the text
+            # also counts read-sample pairs whose better orientation stays below the optimum, from the same rows.
+            pairs = {}
+            for name in sorted(n for n in exact if n.startswith(w)):
+                for x in load_jsonl(BASE / 'exactness' / f'{name}.jsonl'):
+                    if str(x['rho']) == '2':
+                        pairs.setdefault((name, x['read']), {})[x['strand']] = x
+            assert 2 * len(pairs) == inst and all(sorted(s) == ['+', '-'] for s in pairs.values()), w
+            weaker, worst, short = 0, (0.0, False), {'h0': set(), 'h12': set()}
+            for key, s in pairs.items():
+                for x, y in ((s['+'], s['-']), (s['-'], s['+'])):
+                    rel = max(x[b]['rel_gap'] for b in ('h0', 'h12'))
+                    weaker += rel > 0 and x['opt'] < y['opt']
+                    if rel > worst[0]:
+                        worst = (rel, x['opt'] < y['opt'])
+                top = max(s['+']['opt'], s['-']['opt'])
+                for b in short:
+                    loss = top - max(s['+'][b]['best'], s['-'][b]['best'])
+                    assert loss >= 0, (w, key, b)
+                    if loss > 0:
+                        short[b].add(key)
+                        best_losses.append((loss, loss / top))
+            assert worst[0] == max(r['rhos']['2'][b]['max_rel_gap'] for r in reps for b in ('h0', 'h12')), w
+            assert worst[1] or not w.startswith('w32375k'), 'the text: the largest class II loss is in a weaker orientation'
+            either = short['h0'] | short['h12']
+            assert len(either) == max(len(v) for v in short.values()), w  # one bonus's set holds the other's
+            put(f'{k}.giraffe.best.pairs', str(len(pairs)), f'baselevel exactness {w} rho 2: read-sample pairs')
+            put(f'{k}.giraffe.best.below.rho2', str(len(either)), f'baselevel exactness {w} rho 2: read-sample pairs whose better orientation is below exact (either bonus)')
+            put(f'{k}.giraffe.best.reads.rho2', str(len({r for _, r in either})), f'baselevel exactness {w} rho 2: distinct reads of those pairs')
+            put(f'{k}.giraffe.weaker.rho2', str(weaker), f'baselevel exactness {w} rho 2: instances below exact in the read\'s weaker orientation')
+            for b in ('h0', 'h12'):
+                put(f'{k}.giraffe.below.rho2.{b}', str(sum(r['rhos']['2'][b]['instances_below'] for r in reps)),
+                    f'baselevel exactness {w} rho 2: instances below exact with consistency bonus {b[1:]}')
             row += [f'{sum(below["2"])}/{inst}', f'{sum(below["56"])}/{inst}']
         else:
             row += ['--', '--']
@@ -1119,6 +1154,13 @@ def baselevel():
         worst = max(r['rhos'][rho][b]['max_rel_gap'] for r in allrows for rho in r['rhos'] for b in ('h0', 'h12'))
         put('base.giraffe.maxloss', f'{100 * worst:.2f}', 'baselevel exactness summary: largest relative loss over all rho and bonuses (%)')
         put('base.giraffe.samples', str(len(allrows)), 'baselevel exactness summary: window samples')
+        points = max(p for p, _ in best_losses)
+        assert points == 1, 'the text says "at most 1 point"'
+        put('base.giraffe.best.maxloss.points', str(points), 'baselevel exactness rho 2: largest loss in a read\'s better orientation (score points)')
+        put('base.giraffe.best.maxloss.pct', f'{100 * max(r for _, r in best_losses):.2f}',
+            'baselevel exactness rho 2: largest relative loss in a read\'s better orientation (%)')
+    put('base.span.kb.lo', f'{min(spans) / 1000:.0f}', 'baselevel windows: smallest extracted CHM13 reference span (kb, inspect.json reference_bases)')
+    put('base.span.kb.hi', f'{max(spans) / 1000:.0f}', 'baselevel windows: largest extracted CHM13 reference span (kb)')
     put('base.reads', str(tot['reads']), 'baselevel windows reads (sum)')
     put('base.anchors', fint(tot['anchors']), 'baselevel windows anchors (sum)')
     put('base.states.million', f'{tot["states"] / 1e6:.0f}', 'baselevel windows states (sum, millions)')
