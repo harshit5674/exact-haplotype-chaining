@@ -1,0 +1,208 @@
+--- a/graphUtils.cpp	2026-10-06 00:10:06
++++ b/graphUtils.cpp	2026-10-20 19:19:42
+@@ -36,6 +36,173 @@
+ static long full_left = -2;
+ }
+ 
++// ---- Drop-in chainer (experiments/minichain_integrated, 2026-10-20). Inactive unless RECOMB_ENGINE is set.
++//   RECOMB_ENGINE=ph|class|auto   replace the chaining DP by gap_ph_solve, gap_class_packed or
++//                                 gap_auto_packed (cold pair cache) from the native library below
++//   RECOMB_ENGINE_LIB=<path>      that library (research/current/new/gap_native.cpp, as built by gap_native.py)
++// The engines receive Minichain's own component graph, topological order, last2reach and Distance
++// tables, under which they reproduce Minichain's DP values (experiments/minichain_matched). Their
++// output fills C[i][k] = (score, predecessor anchor, predecessor path) in Minichain's convention; a
++// same-anchor switch points to the predecessor of the anchor's best state, as Minichain's task 1 does.
++// Minichain's backtracking and output then run unchanged. C_m and C_p receive B and max(w, R).
++#include <dlfcn.h>
++#include <algorithm>
++#include <string>
++namespace recomb_engine {
++typedef void *(*graph_new_f)(int, int, int, const int64_t *, const uint64_t *, const int64_t *, const int *,
++                             const int64_t *, double *);
++typedef int (*solve_f)(void *, int, const int64_t *, int64_t, const int *, int64_t *, int64_t *, int64_t *,
++                       int64_t *, double *, int);
++typedef int (*auto_f)(void *, int, const int64_t *, int64_t, const int *, int64_t *, int64_t *, int64_t *,
++                      int64_t *, double *, int, double, int);
++typedef const char *(*error_f)();
++static const int DENSE_CUT = 128;       // gap_native.py DENSE_CUT
++static const double AUTO_FACTOR = 1.0;  // gap_native.py AUTO_FACTOR
++
++struct Component {
++    void *handle = nullptr;
++    int V = 0, H = 0, W = 0;
++    std::vector<int> rank;        // local vertex -> topological rank (the engine's vertex id)
++    std::vector<uint64_t> vmask;  // rank * W + q: bit h iff path h visits the vertex
++    std::vector<int> degree;      // rank -> number of paths through the vertex
++};
++struct State {
++    int mode = -1;  // 0 off, 1 per-haplotype, 2 class, 3 guarded
++    graph_new_f graph_new = nullptr;
++    solve_f ph = nullptr, cls = nullptr;
++    auto_f aut = nullptr;
++    error_f error = nullptr;
++    std::vector<Component> comps;
++    long calls = 0, fallbacks = 0;
++    int64_t states = 0;
++};
++static State S;
++
++static void report() {
++    fprintf(stderr, "[M::recomb_engine] mode %d: %ld engine calls, %ld fallbacks, %lld states\n", S.mode, S.calls,
++            S.fallbacks, (long long)S.states);
++}
++
++static int mode() {
++    if (S.mode >= 0) return S.mode;
++    const char *m = recomb_dp::env("RECOMB_ENGINE");
++    if (!m) return S.mode = 0;
++    std::string s(m);
++    S.mode = s == "ph" ? 1 : s == "class" ? 2 : s == "auto" ? 3 : -2;
++    if (S.mode < 0) { fprintf(stderr, "RECOMB_ENGINE must be ph, class or auto\n"); exit(2); }
++    const char *lib = recomb_dp::env("RECOMB_ENGINE_LIB");
++    if (!lib) { fprintf(stderr, "RECOMB_ENGINE_LIB is required with RECOMB_ENGINE\n"); exit(2); }
++    void *h = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
++    if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); exit(2); }
++    S.graph_new = (graph_new_f)dlsym(h, "gap_graph_new");
++    S.ph = (solve_f)dlsym(h, "gap_ph_solve");
++    S.cls = (solve_f)dlsym(h, "gap_class_packed");
++    S.aut = (auto_f)dlsym(h, "gap_auto_packed");
++    S.error = (error_f)dlsym(h, "gap_error");
++    if (!S.graph_new || !S.ph || !S.cls || !S.aut || !S.error) { fprintf(stderr, "engine symbol missing\n"); exit(2); }
++    atexit(report);
++    return S.mode;
++}
++
++// One engine graph per component, built from Minichain's index (after MPC_index; reported as preparation).
++static void build(graphUtils &G) {
++    if (!mode()) return;
++    const int64_t t0 = recomb_dp::now_ns();
++    S.comps.assign(G.num_cid, Component());
++    for (int cid = 0; cid < G.num_cid; cid++) {
++        Component &c = S.comps[cid];
++        const int V = (int)G.adj_cc[cid].size(), H = (int)G.path_cover[cid].size();
++        int W = 1;
++        while (64 * W < H) W *= 2;
++        if (W > 16) { fprintf(stderr, "recomb_engine: at most 1024 paths per component\n"); exit(2); }
++        c.V = V; c.H = H; c.W = W;
++        c.rank.assign(V, -1);
++        for (int r = 0; r < V; r++) c.rank[G.top_order[cid][r]] = r;
++        for (int v = 0; v < V; v++)
++            if (c.rank[v] < 0 || G.map_top_sort[cid][v] != c.rank[v]) { fprintf(stderr, "recomb_engine: order\n"); exit(2); }
++        std::vector<int64_t> len(V), phi((size_t)V * H, 0), dist((size_t)V * H, 0);
++        std::vector<int> last((size_t)V * H, -1);
++        c.vmask.assign((size_t)V * W, 0);
++        c.degree.assign(V, 0);
++        for (int v = 0; v < V; v++) len[c.rank[v]] = G.node_len[G.component_idx[cid][v]];
++        for (int h = 0; h < H; h++)
++            for (int v = 0; v < V; v++) {
++                const int r = c.rank[v];
++                const size_t o = (size_t)r * H + h;
++                if (G.index[cid][h][v] != -1) {
++                    c.vmask[(size_t)r * W + h / 64] |= 1ULL << (h % 64);
++                    c.degree[r]++;
++                    phi[o] = G.dist2begin[cid][h][v];
++                    last[o] = r;
++                } else if (G.last2reach[cid][h][v] != -1) {
++                    last[o] = c.rank[G.path_cover[cid][h][G.last2reach[cid][h][v]]];
++                    dist[o] = G.Distance[cid][h][v];
++                }
++            }
++        double stats[5];
++        c.handle = S.graph_new(V, H, W, len.data(), c.vmask.data(), phi.data(), last.data(), dist.data(), stats);
++        if (!c.handle) { fprintf(stderr, "gap_graph_new: %s\n", S.error()); exit(2); }
++    }
++    fprintf(stderr, "[M::recomb_engine] mode %d: built %d component graphs in %.3f s\n", S.mode, G.num_cid,
++            (recomb_dp::now_ns() - t0) / 1e9);
++}
++
++// Fill Minichain's DP arrays for one read component from the engine's packed all-state output.
++static void fill(graphUtils &G, int cid, const std::vector<Anchors> &M, int64_t cost, Score **C, Score *C_m,
++                 Score *C_p) {
++    Component &c = S.comps[cid];
++    const int N = (int)M.size(), W = c.W;
++    // RECOMB_ENGINE_REVERSE=1 passes the anchors in reverse order. The engines keep the smaller input
++    // index among equal keys, Minichain's range query the larger, so reversal aligns local tie-breaking.
++    static const bool reverse = recomb_dp::flag("RECOMB_ENGINE_REVERSE");
++    std::vector<int64_t> data((size_t)6 * N);
++    std::vector<int> off(N + 1, 0), rv(N), src(N);
++    for (int e = 0; e < N; e++) {
++        const int i = reverse ? N - 1 - e : e;   // engine anchor e is Minichain anchor src[e] = i
++        src[e] = i;
++        const int r = c.rank[G.idx_component[cid][M[i].v]];
++        rv[e] = r;
++        int64_t *d = &data[(size_t)6 * e];
++        d[0] = r; d[1] = M[i].x + 1; d[2] = M[i].y + 1; d[3] = M[i].c + 1; d[4] = M[i].d + 1; d[5] = cost;
++        off[e + 1] = off[e] + c.degree[r];
++    }
++    const size_t K = off[N];
++    std::vector<int64_t> Cv(K), back(K), B(N), R(N);
++    double raw[40] = {0};
++    const int err =
++        S.mode == 1 ? S.ph(c.handle, N, data.data(), G.recomb, off.data(), Cv.data(), back.data(), B.data(), R.data(), raw, DENSE_CUT)
++      : S.mode == 2 ? S.cls(c.handle, N, data.data(), G.recomb, off.data(), Cv.data(), back.data(), B.data(), R.data(), raw, 0)
++      : S.aut(c.handle, N, data.data(), G.recomb, off.data(), Cv.data(), back.data(), B.data(), R.data(), raw, 0, AUTO_FACTOR, DENSE_CUT);
++    if (err) { fprintf(stderr, "recomb_engine: %s\n", S.error()); exit(2); }
++    S.calls++;
++    S.states += (int64_t)K;
++    if (S.mode == 3 && raw[7] != 0) S.fallbacks++;
++    std::vector<int> sa(K), sp(K);  // state -> (Minichain anchor, path); paths ascending, as the engines order them
++    for (int e = 0; e < N; e++) {
++        size_t st = off[e];
++        const uint64_t *m = &c.vmask[(size_t)rv[e] * W];
++        for (int q = 0; q < W; q++)
++            for (uint64_t x = m[q]; x; x &= x - 1) { sa[st] = src[e]; sp[st] = 64 * q + __builtin_ctzll(x); st++; }
++        if ((int)st != off[e + 1]) { fprintf(stderr, "recomb_engine: degree\n"); exit(2); }
++    }
++    for (size_t st = 0; st < K; st++) {
++        const int i = sa[st], h = sp[st];
++        int64_t b = back[st];
++        if (b >= 0 && sa[b] == i) {          // same-anchor switch: take the best state's predecessor
++            b = back[b];
++            if (b >= 0 && sa[b] == i) { fprintf(stderr, "recomb_engine: double switch\n"); exit(2); }
++        }
++        C[i][h].s = Cv[st];
++        C[i][h].i = b >= 0 ? sa[b] : -1;
++        C[i][h].j = b >= 0 ? sp[b] : -1;
++    }
++    for (int e = 0; e < N; e++) {
++        C_m[src[e]].s = B[e];
++        C_p[src[e]].s = std::max(cost, R[e]);
++    }
++}
++}  // namespace recomb_engine
++
+ graphUtils::graphUtils(gfa_t *g)
+ {
+     this->g = g;
+@@ -924,6 +1091,7 @@
+         }
+         fclose(fp);
+     }
++    recomb_engine::build(*this);
+ }
+ 
+ bool compare_T(const Tuples &a, const Tuples &b){
+@@ -937,6 +1105,7 @@
+     static const bool rdp_gate = recomb_dp::flag("RECOMB_DP_GATE");
+     static const bool rdp_time = recomb_dp::env("RECOMB_DP_TIME") != nullptr;
+     static const bool rdp_dump = recomb_dp::env("RECOMB_DP_DUMP") != nullptr;
++    static const int rdp_engine = recomb_engine::mode();
+     if (recomb_dp::full_left == -2)
+         recomb_dp::full_left = recomb_dp::env("RECOMB_DP_FULL") ? atol(recomb_dp::env("RECOMB_DP_FULL")) : 0;
+     const std::string rdp_qname = query_name;
+@@ -1031,6 +1200,7 @@
+             }
+             
+             
++            if (!rdp_engine) // the drop-in chainer replaces the tuple DP below
+             for (int j = 0; j < N; j++) // Add Tuple of Anchors
+             {
+                 int node = M[cid][j].v;
+@@ -1193,6 +1363,7 @@
+                 }
+             }
+ 
++            if (rdp_engine) recomb_engine::fill(*this, cid, M[cid], wt, C, C_m, C_p);
+             if(param_z) std::cerr << "Chaining done for cid : " << cid << "\n";
+             rdp_dp_ns += recomb_dp::now_ns() - rdp_dp0;
+             rdp_tuples += (int64_t)T.size();

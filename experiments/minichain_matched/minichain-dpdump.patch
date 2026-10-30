@@ -1,0 +1,214 @@
+--- mhc_pilot/vendor/minichain/graphUtils.cpp	2026-10-03 22:10:57
++++ minichain_matched/vendor/minichain-dp/graphUtils.cpp	2026-10-06 00:10:06
+@@ -1,6 +1,41 @@
+ #include "graphUtils.h"
+ #include <assert.h>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ 
++// ---- Research-only instrumentation (experiments/minichain_matched). Inactive unless the
++// environment variables below are set; the DP itself is unchanged unless RECOMB_DP_GATE or
++// RECOMB_DP_TRUEDIST is set.
++//   RECOMB_DP_INDEX=<path>    dump each component's graph index once (after MPC_index)
++//   RECOMB_DP_DUMP=<path>     per read and component: input hash, DP-table hashes, best score
++//   RECOMB_DP_FULL=<n>        additionally dump full tables for the first n (read, component) pairs
++//   RECOMB_DP_TIME=<path>     per read: wall time of Chaining() and of its DP section
++//   RECOMB_DP_GATE=1          RMQ default (INT64_MIN,-1): remote value only with a local predecessor
++//   RECOMB_DP_TRUEDIST=1      order-independent shortest-distance relaxation
++namespace recomb_dp {
++static const char *env(const char *k) { const char *v = getenv(k); return (v && *v) ? v : nullptr; }
++static bool flag(const char *k) { const char *v = env(k); return v && v[0] != '0'; }
++static const uint64_t FNV0 = 1469598103934665603ULL;
++static inline uint64_t fnv(uint64_t h, int64_t x) {
++    uint64_t u = (uint64_t)x;
++    for (int b = 0; b < 8; ++b) { h ^= (u >> (8 * b)) & 0xff; h *= 1099511628211ULL; }
++    return h;
++}
++static inline int64_t now_ns() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++static FILE *open_append(const char *k) {
++    const char *p = env(k);
++    if (!p) return nullptr;
++    FILE *fp = fopen(p, "a");
++    if (!fp) { perror(k); exit(2); }
++    return fp;
++}
++static long full_left = -2;
++}
++
+ graphUtils::graphUtils(gfa_t *g)
+ {
+     this->g = g;
+@@ -713,6 +748,7 @@
+ 
+ void graphUtils::MPC_index()
+ {
++    const bool truedist = recomb_dp::flag("RECOMB_DP_TRUEDIST");
+     index.resize(num_cid);
+     rev_index.resize(num_cid);
+     dist2begin.resize(num_cid);
+@@ -789,6 +825,9 @@
+                 for (size_t u : in_node[cid][v]) {
+                     if (last2reach[cid][k][v] == last2reach[cid][k][u] && last2reach[cid][k][v] != -1)
+                     {
++                        if (truedist)
++                            Distance[cid][k][v] = std::min(Distance[cid][k][v], (int)node_len[component_idx[cid][u]] + Distance[cid][k][u]);
++                        else
+                         Distance[cid][k][v] = ((int)node_len[component_idx[cid][u]] + std::min(Distance[cid][k][v], Distance[cid][k][u]));
+                     }
+                 }
+@@ -846,6 +885,44 @@
+         //     }
+         //     std::cerr << std::endl;
+         // }
++    }
++
++    if (FILE *fp = recomb_dp::open_append("RECOMB_DP_INDEX"))
++    {
++        fprintf(fp, "I\tcomponents=%d\ttruedist=%d\n", (int)num_cid, (int)truedist);
++        for (size_t cid = 0; cid < num_cid; cid++)
++        {
++            int V = adj_cc[cid].size(), K = path_cover[cid].size();
++            fprintf(fp, "CID\t%d\t%d\t%d\n", (int)cid, V, K);
++            for (int v = 0; v < V; v++)
++            {
++                int gv = component_idx[cid][v];
++                fprintf(fp, "V\t%d\t%d\t%s\t%d\t%d", v, gv, g->seg[gv >> 1].name, gv & 1, (int)node_len[gv]);
++                fprintf(fp, "\tin");
++                for (int u : in_node[cid][v]) fprintf(fp, ",%d", u);
++                fprintf(fp, "\n");
++            }
++            fprintf(fp, "TOP");
++            for (int v : top_order[cid]) fprintf(fp, "\t%d", v);
++            fprintf(fp, "\n");
++            for (int k = 0; k < K; k++)
++            {
++                fprintf(fp, "P\t%d\t%s", k, walk_map.count(k) ? walk_map[k].c_str() : "?");
++                for (int v : path_cover[cid][k]) fprintf(fp, "\t%d", v);
++                fprintf(fp, "\n");
++            }
++            for (int k = 0; k < K; k++)
++            {
++                fprintf(fp, "L2R\t%d", k);
++                for (int v = 0; v < V; v++) fprintf(fp, "\t%d", last2reach[cid][k][v]);
++                fprintf(fp, "\nDIST\t%d", k);
++                for (int v = 0; v < V; v++) fprintf(fp, "\t%d", Distance[cid][k][v]);
++                fprintf(fp, "\nD2B\t%d", k);
++                for (int v = 0; v < V; v++) fprintf(fp, "\t%d", dist2begin[cid][k][v]);
++                fprintf(fp, "\n");
++            }
++        }
++        fclose(fp);
+     }
+ }
+ 
+@@ -855,6 +932,14 @@
+ 
+ std::vector<mg128_t> graphUtils::Chaining(std::vector<mg128_t> anchors, std::string query_name)
+ {
++    const int64_t rdp_t0 = recomb_dp::now_ns();
++    int64_t rdp_dp_ns = 0, rdp_tuples = 0;
++    static const bool rdp_gate = recomb_dp::flag("RECOMB_DP_GATE");
++    static const bool rdp_time = recomb_dp::env("RECOMB_DP_TIME") != nullptr;
++    static const bool rdp_dump = recomb_dp::env("RECOMB_DP_DUMP") != nullptr;
++    if (recomb_dp::full_left == -2)
++        recomb_dp::full_left = recomb_dp::env("RECOMB_DP_FULL") ? atol(recomb_dp::env("RECOMB_DP_FULL")) : 0;
++    const std::string rdp_qname = query_name;
+     if (param_z)
+     {
+         std::cerr << "Number of Anchors : " << anchors.size() << "\n";
+@@ -909,6 +994,7 @@
+             if (param_z) std::cerr << "Query length : " << seq_len << std::endl;
+             int sf = scale_factor;    
+             if (N == 0) continue;
++            const int64_t rdp_dp0 = recomb_dp::now_ns();
+ 
+             /* Initialise T */
+             std::vector<Tuples> T; // Tuples of Anchors
+@@ -916,7 +1002,7 @@
+ 
+             // RMQ (AVL Tree)
+             std::pair<int, int> defaul_value = {std::numeric_limits<int>::min(), -1};
+-            std::vector<IndexX> I(K, IndexX());
++            std::vector<IndexX> I(K, rdp_gate ? IndexX(std::pair<int64_t, int>(std::numeric_limits<int64_t>::min(), -1)) : IndexX());
+ 
+             // Initialise C as dynamic array
+             Score** C = new Score*[N];
+@@ -1108,7 +1194,57 @@
+             }
+ 
+             if(param_z) std::cerr << "Chaining done for cid : " << cid << "\n";
++            rdp_dp_ns += recomb_dp::now_ns() - rdp_dp0;
++            rdp_tuples += (int64_t)T.size();
+ 
++            if (rdp_dump)
++            {
++                // Input hash over (local vertex, x, y, c, d) in M order; state hash over valid
++                // (anchor, path) pairs in (anchor, path) order; B hash over C_m in anchor order.
++                uint64_t ha = recomb_dp::FNV0, hc = recomb_dp::FNV0, hb = recomb_dp::FNV0, hp = recomb_dp::FNV0;
++                int64_t best = std::numeric_limits<int64_t>::min();
++                long nvalid = 0;
++                for (int a = 0; a < N; a++)
++                {
++                    int lv = idx_component[cid][M[cid][a].v];
++                    ha = recomb_dp::fnv(ha, lv); ha = recomb_dp::fnv(ha, M[cid][a].x); ha = recomb_dp::fnv(ha, M[cid][a].y);
++                    ha = recomb_dp::fnv(ha, M[cid][a].c); ha = recomb_dp::fnv(ha, M[cid][a].d);
++                    for (int k = 0; k < K; k++)
++                        if (index[cid][k][lv] != -1)
++                        {
++                            hc = recomb_dp::fnv(hc, C[a][k].s);
++                            nvalid++;
++                            if (C[a][k].s > best) best = C[a][k].s;
++                        }
++                    hb = recomb_dp::fnv(hb, C_m[a].s);
++                    hp = recomb_dp::fnv(hp, C_p[a].s);
++                }
++                FILE *fp = recomb_dp::open_append("RECOMB_DP_DUMP");
++                fprintf(fp, "Q\t%s\t%d\t%d\t%d\t%lld\t%d\t%d\t%d\n", rdp_qname.c_str(), cid, N, K, (long long)wt, recomb,
++                        (int)rdp_gate, scale_factor);
++                fprintf(fp, "H\t%016llx\t%016llx\t%016llx\t%016llx\t%lld\t%ld\n", (unsigned long long)ha, (unsigned long long)hc,
++                        (unsigned long long)hb, (unsigned long long)hp, (long long)best, nvalid);
++                if (recomb_dp::full_left > 0)
++                {
++                    recomb_dp::full_left--;
++                    for (int a = 0; a < N; a++)
++                    {
++                        int lv = idx_component[cid][M[cid][a].v];
++                        fprintf(fp, "A\t%d\t%d\t%d\t%d\t%d\t%d\t%lld\t%lld\t%lld\t%d\t%d", a, lv, M[cid][a].x, M[cid][a].y, M[cid][a].c,
++                                M[cid][a].d, (long long)C_m[a].s, (long long)C_p[a].s, (long long)C_p[a].i, C_p[a].j, 0);
++                        for (int k = 0; k < K; k++)
++                        {
++                            if (index[cid][k][lv] != -1)
++                                fprintf(fp, "\t%lld:%d:%d", (long long)C[a][k].s, C[a][k].i, C[a][k].j);
++                            else
++                                fprintf(fp, "\t.");
++                        }
++                        fprintf(fp, "\n");
++                    }
++                }
++                fclose(fp);
++            }
++
+             // delete dynamic array
+             delete [] C_m;
+             delete [] C_p;
+@@ -1942,6 +2078,16 @@
+     {
+         std::cerr << "Number of Best Anchors : " << best.size() << "\n";
+     }
++    if (rdp_time)
++    {
++        const int64_t rdp_total = recomb_dp::now_ns() - rdp_t0;
++        FILE *fp = recomb_dp::open_append("RECOMB_DP_TIME");
++        fprintf(fp, "T\t%s\t%lld\t%lld\t%lld\t%zu", rdp_qname.c_str(), (long long)rdp_total, (long long)rdp_dp_ns,
++                (long long)rdp_tuples, anchors.size());
++        for (int cid = 0; cid < num_cid; cid++) fprintf(fp, "\t%zu", M[cid].size());
++        fprintf(fp, "\n");
++        fclose(fp);
++    }
+    return best; // return union of all the disjoint set of chains
+ 
+ }

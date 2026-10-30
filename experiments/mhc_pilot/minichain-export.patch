@@ -1,0 +1,55 @@
+diff --git a/graphUtils.cpp b/graphUtils.cpp
+index 75fcda9..ad959dc 100644
+--- a/graphUtils.cpp
++++ b/graphUtils.cpp
+@@ -9,7 +9,7 @@ graphUtils::graphUtils(gfa_t *g)
+ // Read and store the Graph in Adjacency list
+ void graphUtils::read_graph()
+ {
+-    uint v;
++    unsigned int v;
+     n_vtx = gfa_n_vtx(g);
+     // Resize node_len
+     node_len.resize(n_vtx, 0);
+@@ -24,7 +24,7 @@ void graphUtils::read_graph()
+     }
+     // look for all the edges , if the sum of all the 
+     // edges are zero then, that's a linear reference
+-    u_int num_edges = 0;
++    unsigned int num_edges = 0;
+     for (v = 0; v < n_vtx; v++)
+     {
+         gfa_arc_t *av = gfa_arc_a(g, v);
+@@ -51,7 +51,7 @@ void graphUtils::read_graph()
+             // std::cerr << " node : " << v << " node_len : " << node_len[v] << std::endl; 
+             for (int i = 0; i < n_edges; i++)
+             {
+-                uint w = av[i].w;
++                unsigned int w = av[i].w;
+                 adj_[v_].push_back(w);
+             }
+         }
+diff --git a/map-algo.c b/map-algo.c
+index 5c41b0d..18c56c0 100644
+--- a/map-algo.c
++++ b/map-algo.c
+@@ -391,6 +391,19 @@ void mg_map_frag(const mg_idx_t *gi, int n_segs, const int *qlens, const char **
+ 	if (opt->flag & MG_M_HEAP_SORT) a = collect_seed_hits_heap(b->km, opt, opt->occ_max1, gi, qname, &mv, qlen_sum, &n_a, &rep_len, &n_mini_pos, &mini_pos);
+ 	else a = collect_seed_hits(b->km, opt, opt->occ_max1, gi, qname, &mv, qlen_sum, &n_a, &rep_len, &n_mini_pos, &mini_pos);
+ 
++	// Research-only seed export. The normal mapper is unchanged unless enabled.
++	if (const char *dump = getenv("RECOMB_DUMP_ANCHORS")) {
++		FILE *fp = fopen(dump, "a");
++		if (!fp) { perror("anchor dump"); exit(2); }
++		fprintf(fp, "R\t%s\t%d\t%lld\n", qname, qlen_sum, (long long)n_a);
++		for (int64_t j = 0; j < n_a; ++j)
++			fprintf(fp, "A\t%s\t%d\t%d\t%d\t%d\n", gi->g->seg[a[j].x>>33].name,
++				(int)(a[j].x>>32&1), (int32_t)a[j].x, (int32_t)a[j].y, (int)(a[j].y>>32&0xff));
++		fclose(fp);
++		kfree(b->km, a); kfree(b->km, mv.a); kfree(b->km, mini_pos);
++		return;
++	}
++
+ 	if (mg_dbg_flag & MG_DBG_SEED) {
+ 		fprintf(stderr, "RS\t%d\n", rep_len);
+ 		for (i = 0; i < n_a; ++i)
